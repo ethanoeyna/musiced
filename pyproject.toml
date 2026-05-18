@@ -1,0 +1,23 @@
+[project]
+name = "musiced"
+version = "0.1.0"
+description = "Desktop helper that downloads music URLs as lossless FLAC with embedded cover art and metadata."
+readme = "README.md"
+requires-python = ">=3.14"
+license = "MIT"
+authors = [
+    { name = "Ethan Oey" },
+]
+dependencies = [
+    "mutagen>=1.47.0",
+    "pyqt6>=6.11.0",
+    "yt-dlp>=2026.3.17",
+]
+
+[project.scripts]
+musiced = "musiced:main"
+
+[dependency-groups]
+dev = [
+    "pyinstaller>=6.0",
+]
