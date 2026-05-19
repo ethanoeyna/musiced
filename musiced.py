@@ -10,8 +10,9 @@ from pathlib import Path
 from PyQt6.QtCore import QObject, QThread, Qt, pyqtSignal
 from PyQt6.QtGui import QColor, QFont, QPalette
 from PyQt6.QtWidgets import (
-    QApplication, QFileDialog, QHBoxLayout, QLabel, QLineEdit, QListWidget,
-    QListWidgetItem, QMainWindow, QMenu, QPushButton, QVBoxLayout, QWidget,
+    QApplication, QComboBox, QFileDialog, QHBoxLayout, QLabel, QLineEdit,
+    QListWidget, QListWidgetItem, QMainWindow, QMenu, QPushButton, QVBoxLayout,
+    QWidget,
 )
 
 
@@ -35,6 +36,30 @@ MAX_PARALLEL = 3
 MAX_RETRIES = 2
 
 THUMBNAIL_EXTS = (".jpg", ".jpeg", ".png", ".webp")
+
+# Output format catalog. Each entry: yt-dlp codec key, target extension, label
+# shown in the UI, and the optional kbps the FFmpegExtractAudio postprocessor
+# should pass when encoding a lossy codec. FLAC is lossless so kbps is unused.
+#
+# Sizes are roughly what we see for a 4-minute YouTube source:
+#   flac (lossless container around lossy source) → ~35 MB
+#   opus 192                                       → ~5  MB
+#   mp3  320                                       → ~9  MB
+#   m4a/aac 256                                    → ~7  MB
+#
+# Default stays "flac" so existing users see no behaviour change on upgrade.
+FORMATS = {
+    "flac":     {"codec": "flac", "ext": ".flac", "label": "FLAC (lossless)",          "kbps": None},
+    "opus_192": {"codec": "opus", "ext": ".opus", "label": "Opus 192 kbps (small)",    "kbps": "192"},
+    "opus_256": {"codec": "opus", "ext": ".opus", "label": "Opus 256 kbps (transparent)", "kbps": "256"},
+    "mp3_320":  {"codec": "mp3",  "ext": ".mp3",  "label": "MP3 320 kbps (compatible)", "kbps": "320"},
+    "m4a_256":  {"codec": "m4a",  "ext": ".m4a",  "label": "AAC 256 kbps (compatible)", "kbps": "256"},
+}
+DEFAULT_FORMAT_KEY = "flac"
+# All audio extensions Musiced may have written — used by the orphan sweeper so
+# leftover .flac thumbnails are cleaned up even when the user is now downloading
+# as Opus, etc.
+AUDIO_EXTS = tuple({fmt["ext"] for fmt in FORMATS.values()})
 
 
 def _default_music_dir() -> Path:
@@ -253,8 +278,28 @@ def _fetch_title(url: str) -> str | None:
         return None
 
 
-def _output_path_for(out_dir: Path, title: str) -> Path:
-    return out_dir / f"{_safe_filename(title)}.flac"
+def _output_path_for(out_dir: Path, title: str, ext: str = ".flac") -> Path:
+    if not ext.startswith("."):
+        ext = "." + ext
+    return out_dir / f"{_safe_filename(title)}{ext}"
+
+
+def _existing_audio_for(out_dir: Path, title: str) -> Path | None:
+    """Return an existing audio file for `title` regardless of extension.
+
+    Lets us skip re-downloading a song the user already has in any format —
+    e.g. they downloaded as FLAC last week and switched to Opus, we still
+    skip instead of re-encoding the same source twice.
+    """
+    safe = _safe_filename(title)
+    for ext in AUDIO_EXTS:
+        candidate = out_dir / f"{safe}{ext}"
+        try:
+            if candidate.exists() and candidate.stat().st_size > 0:
+                return candidate
+        except OSError:
+            continue
+    return None
 
 
 def _cleanup_thumbnails(out_dir: Path, title: str):
@@ -276,10 +321,16 @@ def _cleanup_thumbnails(out_dir: Path, title: str):
 def _cleanup_all_orphans(out_dir: Path):
     if not out_dir.exists():
         return
-    flac_stems = {p.stem for p in out_dir.glob("*.flac")}
+    # Build the set of "real" audio stems we want to keep.
+    audio_stems: set[str] = set()
+    for ext in AUDIO_EXTS:
+        audio_stems.update(p.stem for p in out_dir.glob(f"*{ext}"))
     for ext in THUMBNAIL_EXTS + (".part", ".ytdl", ".temp"):
         for candidate in out_dir.glob(f"*{ext}"):
-            if candidate.stem in flac_stems or candidate.stem.rsplit(".", 1)[0] in flac_stems:
+            if (
+                candidate.stem in audio_stems
+                or candidate.stem.rsplit(".", 1)[0] in audio_stems
+            ):
                 try:
                     candidate.unlink()
                 except OSError:
@@ -333,11 +384,15 @@ class DownloadWorker(QObject):
     all_done = pyqtSignal()
 
     def __init__(self, jobs: list[DownloadJob], indices: list[int],
-                 ffmpeg_location: str | None):
+                 ffmpeg_location: str | None,
+                 format_key: str = DEFAULT_FORMAT_KEY):
         super().__init__()
         self.jobs = jobs
         self.indices = indices
         self.ffmpeg_location = ffmpeg_location
+        # Snapshot the format at worker construction. If the user changes the
+        # dropdown mid-batch, in-flight jobs keep the format they started with.
+        self.format_spec = FORMATS.get(format_key) or FORMATS[DEFAULT_FORMAT_KEY]
 
     def run(self):
         try:
@@ -368,11 +423,15 @@ class DownloadWorker(QObject):
     def _run_one(self, job: DownloadJob, list_i: int):
         from yt_dlp import YoutubeDL
 
-        expected = _output_path_for(job.out_dir, job.title)
-        if expected.exists() and expected.stat().st_size > 0:
+        # Skip if a file with this title already exists in ANY of our known
+        # output formats — not just the currently-selected one. Switching
+        # the dropdown shouldn't cause us to re-download tracks the user has.
+        existing = _existing_audio_for(job.out_dir, job.title)
+        if existing is not None:
             _cleanup_thumbnails(job.out_dir, job.title)
             self.job_finished.emit(
-                list_i, DownloadJob.SKIPPED, f"Already exists: {expected.name}"
+                list_i, DownloadJob.SKIPPED,
+                f"Already exists: {existing.name}",
             )
             return
 
@@ -392,6 +451,16 @@ class DownloadWorker(QObject):
                 title = d.get("info_dict", {}).get("title") or job.title
                 self.job_progress.emit(idx, title, 100)
 
+        # Build the FFmpegExtractAudio postprocessor block. FLAC is lossless,
+        # so we omit the quality field; for lossy codecs we pass preferredquality
+        # which yt-dlp surfaces to ffmpeg as the target bitrate.
+        extract_pp: dict = {
+            "key": "FFmpegExtractAudio",
+            "preferredcodec": self.format_spec["codec"],
+        }
+        if self.format_spec["kbps"]:
+            extract_pp["preferredquality"] = self.format_spec["kbps"]
+
         opts = {
             "format": (
                 "bestaudio[ext=m4a]/bestaudio[ext=webm]/"
@@ -399,7 +468,7 @@ class DownloadWorker(QObject):
             ),
             "outtmpl": str(job.out_dir / "%(title)s.%(ext)s"),
             "postprocessors": [
-                {"key": "FFmpegExtractAudio", "preferredcodec": "flac"},
+                extract_pp,
                 {"key": "FFmpegMetadata", "add_metadata": True},
                 {"key": "EmbedThumbnail", "already_have_thumbnail": False},
             ],
@@ -470,6 +539,10 @@ class Musiced(QMainWindow):
             self._config.get("out_dir") or _default_music_dir()
         )
         self._out_dir.mkdir(parents=True, exist_ok=True)
+        # Output format. Stored in config so the choice survives restarts.
+        # Validate against the catalog — unknown values fall back to default.
+        saved_fmt = self._config.get("format")
+        self._format_key = saved_fmt if saved_fmt in FORMATS else DEFAULT_FORMAT_KEY
         self._jobs: list[DownloadJob] = []
         self._worker_thread: QThread | None = None
         self._worker: DownloadWorker | None = None
@@ -508,6 +581,22 @@ class Musiced(QMainWindow):
         self.out_label.setStyleSheet(f"color: {COLOR_TEXT_SECONDARY.name()};")
         top.addWidget(self.out_label)
         top.addStretch(1)
+        # Format selector. Order in the dropdown follows insertion order in
+        # FORMATS — FLAC first to preserve the historical default at the top
+        # of the list, then smaller-file options below.
+        format_label = QLabel("Format:")
+        format_label.setStyleSheet(f"color: {COLOR_TEXT_SECONDARY.name()};")
+        top.addWidget(format_label)
+        self.format_combo = QComboBox()
+        for key, spec in FORMATS.items():
+            self.format_combo.addItem(spec["label"], userData=key)
+        # Select the persisted choice
+        for i in range(self.format_combo.count()):
+            if self.format_combo.itemData(i) == self._format_key:
+                self.format_combo.setCurrentIndex(i)
+                break
+        self.format_combo.currentIndexChanged.connect(self._on_format_changed)
+        top.addWidget(self.format_combo)
         self.change_dir_btn = QPushButton("Change folder")
         self.change_dir_btn.clicked.connect(self._on_change_dir)
         top.addWidget(self.change_dir_btn)
@@ -631,6 +720,18 @@ class Musiced(QMainWindow):
             and self._ffprobe_path is not None
         )
         self.start_btn.setEnabled(ready)
+
+    def _on_format_changed(self, index: int):
+        # Persist the new format choice immediately. Any *in-flight* worker
+        # keeps its captured format_spec — only the next batch picks up the
+        # new value. This keeps a running job's output extension consistent
+        # with what was selected when the user hit Download.
+        key = self.format_combo.itemData(index)
+        if key not in FORMATS:
+            return
+        self._format_key = key
+        self._config["format"] = key
+        _save_json(CONFIG_PATH, self._config)
 
     def _on_change_dir(self):
         path = QFileDialog.getExistingDirectory(
@@ -777,6 +878,7 @@ class Musiced(QMainWindow):
         self.add_btn.setEnabled(False)
         self.clear_btn.setEnabled(False)
         self.url_input.setEnabled(False)
+        self.format_combo.setEnabled(False)
         self._set_status(
             f"Downloading {len(pending_idx)} item(s) "
             f"({MAX_PARALLEL} at a time)…"
@@ -786,7 +888,8 @@ class Musiced(QMainWindow):
 
         self._worker_thread = QThread()
         self._worker = DownloadWorker(
-            jobs_to_run, pending_idx, self._ffmpeg_dir
+            jobs_to_run, pending_idx, self._ffmpeg_dir,
+            format_key=self._format_key,
         )
         self._worker.moveToThread(self._worker_thread)
         self._worker_thread.started.connect(self._worker.run)
@@ -829,6 +932,7 @@ class Musiced(QMainWindow):
         self.add_btn.setEnabled(True)
         self.clear_btn.setEnabled(True)
         self.url_input.setEnabled(True)
+        self.format_combo.setEnabled(True)
 
         _cleanup_all_orphans(self._out_dir)
         self._update_start_btn()
