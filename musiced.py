@@ -3,6 +3,19 @@ Musiced — local-library audio downloader. PyQt6 desktop app.
 
 Download backend: yt-dlp (YouTube, SoundCloud, Bandcamp, Archive, Vimeo, etc.).
 
+Stateless by design: no config files, no queue persistence, no JSON written
+anywhere. Each launch starts fresh.
+  - Output folder defaults to ~/Downloads/musiced (created lazily on the
+    first download, not on startup).
+  - Output format defaults to AAC 256 kbps (m4a_256).
+  - Format dropdown and "Change folder" remain functional for in-session
+    use; the choices simply don't survive a restart. This is intentional.
+
+This matters for the portable .exe distribution: nothing spawns next to the
+executable. Drop Musiced.exe anywhere — Desktop, USB stick, network share —
+and it leaves no footprint beyond the files it downloads into the chosen
+output folder.
+
 Deeplink protocol (lucyna://download?url=...&title=...):
   - Accepted from lucyna.dev/musiced search results' Download buttons
   - The `url` query param is the actual track URL to queue; it can be
@@ -14,7 +27,6 @@ Deeplink protocol (lucyna://download?url=...&title=...):
     raises its window
 """
 
-import json
 import os
 import re
 import shutil
@@ -41,15 +53,6 @@ from PyQt6.QtWidgets import (
 APP_NAME = "Musiced"
 APP_DIR = Path(__file__).resolve().parent
 
-# Writable state lives next to the exe when bundled (PyInstaller's _MEIPASS
-# is a temp dir that gets wiped on each launch), next to the script otherwise.
-if getattr(sys, "frozen", False):
-    DATA_DIR = Path(sys.executable).parent / "data"
-else:
-    DATA_DIR = APP_DIR / "data"
-CONFIG_PATH = DATA_DIR / "config.json"
-QUEUE_PATH = DATA_DIR / "queue.json"
-
 MAX_PARALLEL = 3
 MAX_RETRIES = 2
 
@@ -65,7 +68,7 @@ FORMATS = {
     "mp3_320":  {"codec": "mp3",  "ext": ".mp3",  "label": "MP3 320 kbps (compatible)", "kbps": "320"},
     "m4a_256":  {"codec": "m4a",  "ext": ".m4a",  "label": "AAC 256 kbps (compatible)", "kbps": "256"},
 }
-DEFAULT_FORMAT_KEY = "flac"
+DEFAULT_FORMAT_KEY = "m4a_256"
 # All audio extensions Musiced may have written — used by the orphan sweeper
 # so leftover thumbnails are cleaned up regardless of the current format.
 AUDIO_EXTS = tuple({fmt["ext"] for fmt in FORMATS.values()})
@@ -75,24 +78,6 @@ AUDIO_EXTS = tuple({fmt["ext"] for fmt in FORMATS.values()})
 # launches hand off their argv on this socket; the primary picks it up via
 # the `newConnection` signal and treats it as a fresh deep-link.
 SINGLE_INSTANCE_KEY = "lucyna.musiced.singleinstance"
-
-
-def _default_music_dir() -> Path:
-    return Path.home() / "Downloads" / "musiced"
-
-
-def _load_json(path: Path, default):
-    if not path.exists():
-        return default
-    try:
-        return json.loads(path.read_text())
-    except (json.JSONDecodeError, OSError):
-        return default
-
-
-def _save_json(path: Path, value):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(value, indent=2))
 
 
 # ----------------------------------------------------------------------------
@@ -705,15 +690,14 @@ class Musiced(QMainWindow):
         self.resize(900, 600)
         self.setMinimumSize(640, 420)
 
-        self._config = _load_json(CONFIG_PATH, {})
-        self._out_dir = Path(
-            self._config.get("out_dir") or _default_music_dir()
-        )
-        self._out_dir.mkdir(parents=True, exist_ok=True)
-        # Output format. Stored in config so the choice survives restarts.
-        # Validate against the catalog — unknown values fall back to default.
-        saved_fmt = self._config.get("format")
-        self._format_key = saved_fmt if saved_fmt in FORMATS else DEFAULT_FORMAT_KEY
+        # Stateless: output folder is hard-coded, no config load. The folder
+        # is NOT created here — the download path's mkdir handles that lazily
+        # when the first track actually downloads, so a Musiced launch leaves
+        # no footprint until you actually use it.
+        self._out_dir = Path.home() / "Downloads" / "musiced"
+        # Stateless: format is hard-coded to AAC 256 — same reasoning. The
+        # dropdown is still wired up for in-session changes.
+        self._format_key = "m4a_256"
         self._jobs: list[DownloadJob] = []
         self._worker_thread: QThread | None = None
         self._worker: DownloadWorker | None = None
@@ -734,7 +718,6 @@ class Musiced(QMainWindow):
 
         self.setFont(_make_font(10))
         self._build_ui()
-        self._restore_queue()
         self._refresh_out_label()
         self._refresh_ffmpeg_status()
         self._update_start_btn()
@@ -846,21 +829,6 @@ class Musiced(QMainWindow):
                 COLOR_STATUS_ERR,
             )
 
-    def _restore_queue(self):
-        data = _load_json(QUEUE_PATH, [])
-        for d in data:
-            try:
-                job = DownloadJob.from_dict(d)
-                if job.status in (DownloadJob.DONE, DownloadJob.SKIPPED):
-                    continue
-                self._jobs.append(job)
-                self._render_job_row(job, len(self._jobs) - 1)
-            except Exception:
-                continue
-
-    def _save_queue(self):
-        _save_json(QUEUE_PATH, [j.to_dict() for j in self._jobs])
-
     def _render_job_row(self, job: DownloadJob, list_i: int):
         if job.status == DownloadJob.QUEUED:
             text = f"[queued]  {job.title}"
@@ -909,16 +877,14 @@ class Musiced(QMainWindow):
         self.start_btn.setEnabled(ready)
 
     def _on_format_changed(self, index: int):
-        # Persist the new format choice immediately. Any *in-flight* worker
-        # keeps its captured format_spec — only the next batch picks up the
-        # new value. This keeps a running job's output extension consistent
-        # with what was selected when the user hit Download.
+        # In-session only — no persistence. Any *in-flight* worker keeps its
+        # captured format_spec; only the next batch picks up the new value.
+        # This keeps a running job's output extension consistent with what
+        # was selected when the user hit Download.
         key = self.format_combo.itemData(index)
         if key not in FORMATS:
             return
         self._format_key = key
-        self._config["format"] = key
-        _save_json(CONFIG_PATH, self._config)
 
     def _on_change_dir(self):
         path = QFileDialog.getExistingDirectory(
@@ -926,9 +892,6 @@ class Musiced(QMainWindow):
         )
         if path:
             self._out_dir = Path(path)
-            self._out_dir.mkdir(parents=True, exist_ok=True)
-            self._config["out_dir"] = str(self._out_dir)
-            _save_json(CONFIG_PATH, self._config)
             self._refresh_out_label()
 
     def _on_open_dir(self):
@@ -953,7 +916,6 @@ class Musiced(QMainWindow):
         except Exception as e:
             self._set_status(f"Add failed: {e}", COLOR_STATUS_ERR)
             return
-        self._save_queue()
         self._update_start_btn()
 
     def _add_single(self, url: str):
@@ -995,7 +957,6 @@ class Musiced(QMainWindow):
             return
         job.title = title
         self._render_job_row(job, list_i)
-        self._save_queue()
 
     # ----- Deep link plumbing -----
 
@@ -1006,7 +967,6 @@ class Musiced(QMainWindow):
         list_i = len(self._jobs) - 1
         self._render_job_row(job, list_i)
         self._prefetch_title(list_i, url)
-        self._save_queue()
         self._update_start_btn()
         self._set_status(f"Added from lucyna.dev: {title or url}")
 
@@ -1058,7 +1018,6 @@ class Musiced(QMainWindow):
             return
         del self._jobs[list_i]
         self.queue_list.takeItem(list_i)
-        self._save_queue()
         self._update_start_btn()
 
     def _retry_one(self, list_i: int):
@@ -1069,7 +1028,6 @@ class Musiced(QMainWindow):
         job.progress = 0
         job.error = ""
         self._render_job_row(job, list_i)
-        self._save_queue()
         self._update_start_btn()
 
     def _on_clear(self):
@@ -1077,7 +1035,6 @@ class Musiced(QMainWindow):
             return
         self._jobs.clear()
         self.queue_list.clear()
-        self._save_queue()
         self._update_start_btn()
         self._set_status("Ready.")
 
@@ -1146,7 +1103,6 @@ class Musiced(QMainWindow):
             job.status = DownloadJob.FAILED
             job.error = msg
         self._render_job_row(job, list_i)
-        self._save_queue()
 
     def _on_all_done(self):
         if self._worker_thread is not None:
@@ -1176,7 +1132,6 @@ class Musiced(QMainWindow):
             COLOR_STATUS_INFO
         )
         self._set_status("Done. " + ", ".join(parts) + ".", color)
-        self._save_queue()
 
 
 def main():
