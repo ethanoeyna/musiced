@@ -1,6 +1,6 @@
 [project]
 name = "musiced"
-version = "0.1.0"
+version = "0.3.0"
 description = "Desktop helper that downloads music URLs as lossless FLAC with embedded cover art and metadata."
 readme = "README.md"
 requires-python = ">=3.14"
