@@ -1,3 +1,19 @@
+"""
+Musiced — local-library audio downloader. PyQt6 desktop app.
+
+Download backend: yt-dlp (YouTube, SoundCloud, Bandcamp, Archive, Vimeo, etc.).
+
+Deeplink protocol (lucyna://download?url=...&title=...):
+  - Accepted from lucyna.dev/musiced search results' Download buttons
+  - The `url` query param is the actual track URL to queue; it can be
+    any source yt-dlp supports
+  - Optional `title` query param is used as the display name until the
+    title prefetch / download resolves the canonical name
+  - Single-instance enforcement via QLocalServer — secondary launches
+    hand off argv to the primary, the primary appends the job and
+    raises its window
+"""
+
 import json
 import os
 import re
@@ -6,9 +22,11 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, Future
 from pathlib import Path
+from urllib.parse import urlparse, parse_qs
 
 from PyQt6.QtCore import QObject, QThread, Qt, pyqtSignal
 from PyQt6.QtGui import QColor, QFont, QPalette
+from PyQt6.QtNetwork import QLocalServer, QLocalSocket
 from PyQt6.QtWidgets import (
     QApplication, QComboBox, QFileDialog, QHBoxLayout, QLabel, QLineEdit,
     QListWidget, QListWidgetItem, QMainWindow, QMenu, QPushButton, QVBoxLayout,
@@ -40,14 +58,6 @@ THUMBNAIL_EXTS = (".jpg", ".jpeg", ".png", ".webp")
 # Output format catalog. Each entry: yt-dlp codec key, target extension, label
 # shown in the UI, and the optional kbps the FFmpegExtractAudio postprocessor
 # should pass when encoding a lossy codec. FLAC is lossless so kbps is unused.
-#
-# Sizes are roughly what we see for a 4-minute YouTube source:
-#   flac (lossless container around lossy source) → ~35 MB
-#   opus 192                                       → ~5  MB
-#   mp3  320                                       → ~9  MB
-#   m4a/aac 256                                    → ~7  MB
-#
-# Default stays "flac" so existing users see no behaviour change on upgrade.
 FORMATS = {
     "flac":     {"codec": "flac", "ext": ".flac", "label": "FLAC (lossless)",          "kbps": None},
     "opus_192": {"codec": "opus", "ext": ".opus", "label": "Opus 192 kbps (small)",    "kbps": "192"},
@@ -56,10 +66,15 @@ FORMATS = {
     "m4a_256":  {"codec": "m4a",  "ext": ".m4a",  "label": "AAC 256 kbps (compatible)", "kbps": "256"},
 }
 DEFAULT_FORMAT_KEY = "flac"
-# All audio extensions Musiced may have written — used by the orphan sweeper so
-# leftover .flac thumbnails are cleaned up even when the user is now downloading
-# as Opus, etc.
+# All audio extensions Musiced may have written — used by the orphan sweeper
+# so leftover thumbnails are cleaned up regardless of the current format.
 AUDIO_EXTS = tuple({fmt["ext"] for fmt in FORMATS.values()})
+
+# Single-instance socket key. QLocalServer/QLocalSocket use a named socket
+# (named pipe on Windows, unix socket under /tmp on Linux). Secondary
+# launches hand off their argv on this socket; the primary picks it up via
+# the `newConnection` signal and treats it as a fresh deep-link.
+SINGLE_INSTANCE_KEY = "lucyna.musiced.singleinstance"
 
 
 def _default_music_dir() -> Path:
@@ -78,6 +93,58 @@ def _load_json(path: Path, default):
 def _save_json(path: Path, value):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(value, indent=2))
+
+
+# ----------------------------------------------------------------------------
+# Deep link parsing  (lucyna://download?url=...&title=...)
+# ----------------------------------------------------------------------------
+
+def _parse_deeplink(argv: list[str]) -> tuple[str, str | None] | None:
+    """
+    Look through argv for a lucyna:// URL. Return (track_url, title) on hit,
+    None on miss. The `url` query param is the actual track URL to add to
+    the queue; the optional `title` is used as the display name until the
+    title prefetch / download resolves the canonical name.
+
+    Accepted shapes (both fine — depends on the OS protocol handler):
+      lucyna://download?url=<urlencoded>&title=<urlencoded>
+      lucyna:///download?url=<urlencoded>&title=<urlencoded>
+    """
+    for arg in argv[1:]:
+        if not arg.startswith("lucyna://"):
+            continue
+        try:
+            u = urlparse(arg)
+        except ValueError:
+            continue
+        # urlparse puts "download" into netloc for lucyna://download?...
+        # and into path for lucyna:///download?... — accept either form
+        if u.netloc != "download" and u.path.lstrip("/") != "download":
+            continue
+        qs = parse_qs(u.query)
+        track_urls = qs.get("url") or []
+        if not track_urls:
+            continue
+        titles = qs.get("title") or []
+        return (track_urls[0], titles[0] if titles else None)
+    return None
+
+
+def _try_send_to_existing(payload: str) -> bool:
+    """
+    Try to hand off our argv to an already-running Musiced. Returns
+    True if delivered (caller should exit), False if no existing
+    instance was reachable (caller should start as primary).
+    """
+    sock = QLocalSocket()
+    sock.connectToServer(SINGLE_INSTANCE_KEY)
+    if not sock.waitForConnected(500):
+        return False
+    sock.write(payload.encode("utf-8"))
+    sock.flush()
+    sock.waitForBytesWritten(500)
+    sock.disconnectFromServer()
+    return True
 
 
 # ----------------------------------------------------------------------------
@@ -115,6 +182,110 @@ def find_ffmpeg() -> str | None:
 
 def find_ffprobe() -> str | None:
     return _find_binary("ffprobe")
+
+
+# ----------------------------------------------------------------------------
+# Protocol registration  (lucyna:// → this binary)
+# ----------------------------------------------------------------------------
+
+def _launch_command_parts() -> tuple[str, list[str]]:
+    """
+    Return (executable, extra_args_before_url) for the OS to invoke when
+    a lucyna:// URL is opened. When frozen by PyInstaller we point at the
+    bundled exe; in dev we point python at the script.
+    """
+    if getattr(sys, "frozen", False):
+        return (sys.executable, [])
+    return (sys.executable, [str(Path(__file__).resolve())])
+
+
+def _register_protocol_windows():
+    """
+    Register lucyna:// under HKEY_CURRENT_USER\\Software\\Classes\\lucyna.
+    HKCU keeps it user-scoped (no admin prompt). Idempotent — re-running
+    just overwrites the values with the current paths.
+    """
+    import winreg  # local import: Windows-only
+
+    exe, extras = _launch_command_parts()
+    quoted = f'"{exe}"' + ("".join(f' "{a}"' for a in extras))
+    command = f'{quoted} "%1"'
+
+    root = winreg.HKEY_CURRENT_USER
+    base = r"Software\Classes\lucyna"
+    with winreg.CreateKey(root, base) as k:
+        winreg.SetValueEx(k, "", 0, winreg.REG_SZ, "URL:Lucyna Protocol")
+        winreg.SetValueEx(k, "URL Protocol", 0, winreg.REG_SZ, "")
+    with winreg.CreateKey(root, base + r"\shell\open\command") as k:
+        winreg.SetValueEx(k, "", 0, winreg.REG_SZ, command)
+
+
+def _register_protocol_linux():
+    """
+    Write ~/.local/share/applications/musiced.desktop and tell xdg-mime
+    that we own x-scheme-handler/lucyna. Idempotent.
+    """
+    import subprocess  # local import: keeps top-level imports tidy
+
+    exe, extras = _launch_command_parts()
+    exec_line = " ".join([exe] + extras + ["%u"])
+    desktop = (
+        "[Desktop Entry]\n"
+        "Type=Application\n"
+        f"Name={APP_NAME}\n"
+        f"Exec={exec_line}\n"
+        "StartupNotify=true\n"
+        "MimeType=x-scheme-handler/lucyna;\n"
+        "Categories=AudioVideo;Audio;\n"
+    )
+    apps_dir = Path.home() / ".local" / "share" / "applications"
+    apps_dir.mkdir(parents=True, exist_ok=True)
+    desktop_path = apps_dir / "musiced.desktop"
+    desktop_path.write_text(desktop)
+
+    # xdg-mime sets the default handler. Silent on success; failures are
+    # non-fatal — the .desktop file is enough for Gnome / KDE menus.
+    try:
+        subprocess.run(
+            ["xdg-mime", "default", "musiced.desktop", "x-scheme-handler/lucyna"],
+            check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=5,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+
+
+def _register_protocol_handler():
+    """
+    Self-register lucyna:// as our protocol on every launch. Idempotent.
+    Failures are non-fatal — log to stderr and continue. macOS is handled
+    at packaging time via CFBundleURLTypes in the .app's Info.plist; see
+    the docstring at the top of this file for the required fragment.
+    """
+    try:
+        if sys.platform.startswith("win"):
+            _register_protocol_windows()
+        elif sys.platform == "linux":
+            _register_protocol_linux()
+        # macOS: handled by Info.plist at packaging time. Nothing to do here.
+    except Exception as e:
+        print(f"protocol registration failed (non-fatal): {e}", file=sys.stderr)
+
+
+# macOS Info.plist fragment (packaging-time, not runtime). Document for the
+# PyInstaller .spec / py2app config:
+#
+#   <key>CFBundleURLTypes</key>
+#   <array>
+#     <dict>
+#       <key>CFBundleURLName</key>
+#       <string>dev.lucyna.musiced</string>
+#       <key>CFBundleURLSchemes</key>
+#       <array>
+#         <string>lucyna</string>
+#       </array>
+#     </dict>
+#   </array>
 
 
 # ----------------------------------------------------------------------------
@@ -568,6 +739,22 @@ class Musiced(QMainWindow):
         self._refresh_ffmpeg_status()
         self._update_start_btn()
 
+        # Single-instance server. Listens on a named socket for secondary
+        # launches to hand off their argv. Stale sockets from a crashed
+        # prior run are dropped via removeServer before listen() so we
+        # don't fail to bind.
+        self._instance_server = QLocalServer(self)
+        QLocalServer.removeServer(SINGLE_INSTANCE_KEY)
+        self._instance_server.listen(SINGLE_INSTANCE_KEY)
+        self._instance_server.newConnection.connect(self._on_secondary_launch)
+
+        # Launch-time deep link (the first argv). Secondary launches go
+        # through main() → _try_send_to_existing → _on_secondary_launch.
+        deeplink = _parse_deeplink(sys.argv)
+        if deeplink is not None:
+            url, title = deeplink
+            self._queue_deeplink(url, title)
+
     def _build_ui(self):
         central = QWidget()
         self.setCentralWidget(central)
@@ -609,7 +796,7 @@ class Musiced(QMainWindow):
         url_row.setSpacing(8)
         self.url_input = QLineEdit()
         self.url_input.setPlaceholderText(
-            "Paste a URL — YouTube (track/playlist), SoundCloud, etc."
+            "Paste a URL — YouTube, SoundCloud, Bandcamp, etc."
         )
         self.url_input.returnPressed.connect(self._on_add_url)
         url_row.addWidget(self.url_input, stretch=1)
@@ -810,6 +997,44 @@ class Musiced(QMainWindow):
         self._render_job_row(job, list_i)
         self._save_queue()
 
+    # ----- Deep link plumbing -----
+
+    def _queue_deeplink(self, url: str, title: str | None):
+        """Add a deep-linked track URL to the queue, same shape as the manual paste flow."""
+        job = DownloadJob(url, self._out_dir, display=title or url)
+        self._jobs.append(job)
+        list_i = len(self._jobs) - 1
+        self._render_job_row(job, list_i)
+        self._prefetch_title(list_i, url)
+        self._save_queue()
+        self._update_start_btn()
+        self._set_status(f"Added from lucyna.dev: {title or url}")
+
+    def _on_secondary_launch(self):
+        """
+        Secondary launch handler. A second Musiced.exe (or `python musiced.py
+        ...`) invocation sends its argv on the QLocalServer socket and exits;
+        we read it, parse the deep link, append to the queue, and surface
+        the window.
+        """
+        sock = self._instance_server.nextPendingConnection()
+        if sock is None:
+            return
+        if not sock.waitForReadyRead(500):
+            sock.disconnectFromServer()
+            return
+        payload = bytes(sock.readAll()).decode("utf-8", errors="replace")
+        sock.disconnectFromServer()
+        argv = payload.split("\n")
+        deeplink = _parse_deeplink(argv)
+        if deeplink is None:
+            return
+        url, title = deeplink
+        self._queue_deeplink(url, title)
+        # Bring the existing window to front so the new row is visible.
+        self.raise_()
+        self.activateWindow()
+
     def _on_queue_context_menu(self, pos):
         item = self.queue_list.itemAt(pos)
         if item is None:
@@ -956,8 +1181,23 @@ class Musiced(QMainWindow):
 
 def main():
     os.environ["QT_LOGGING_RULES"] = "qt.qpa.fonts.warning=false"
+
+    # If launched with a deep link AND another instance is running, hand
+    # off and exit — the primary will pick it up via QLocalServer. We do
+    # this BEFORE constructing the QApplication so we don't briefly flash
+    # a second window and don't ever own a second event loop.
+    if _parse_deeplink(sys.argv) is not None:
+        payload = "\n".join(sys.argv)
+        if _try_send_to_existing(payload):
+            return
+
     app = QApplication(sys.argv)
     _apply_style(app)
+
+    # Self-register lucyna:// on every launch. Idempotent, non-fatal on
+    # failure. macOS is handled at packaging time via Info.plist.
+    _register_protocol_handler()
+
     window = Musiced()
     window.show()
     sys.exit(app.exec())

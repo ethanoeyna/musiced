@@ -14,3 +14,7 @@ data/
 
 # Claude Code per-machine state
 .claude/
+
+# Spotipy / spotdl token caches (contain live OAuth tokens — never commit)
+.cache
+.spotdl/
