@@ -25,6 +25,10 @@ Deeplink protocol (lucyna://download?url=...&title=...):
   - Single-instance enforcement via QLocalServer — secondary launches
     hand off argv to the primary, the primary appends the job and
     raises its window
+  - Deep-linked jobs auto-start downloading on arrival (the click on
+    lucyna.dev IS the user's intent to download — no second click in
+    the Musiced window required). Manual paste via the URL input
+    intentionally stays a two-step flow.
 """
 
 import os
@@ -961,14 +965,51 @@ class Musiced(QMainWindow):
     # ----- Deep link plumbing -----
 
     def _queue_deeplink(self, url: str, title: str | None):
-        """Add a deep-linked track URL to the queue, same shape as the manual paste flow."""
+        """Add a deep-linked track URL to the queue, same shape as the
+        manual paste flow — except a deep link auto-starts the download.
+        The user already clicked Download on lucyna.dev; making them
+        click Download again in the Musiced window would be friction
+        with no payoff. Manual paste via the URL input intentionally
+        stays a two-step flow because users often queue several URLs
+        before starting the batch."""
         job = DownloadJob(url, self._out_dir, display=title or url)
         self._jobs.append(job)
         list_i = len(self._jobs) - 1
         self._render_job_row(job, list_i)
         self._prefetch_title(list_i, url)
         self._update_start_btn()
-        self._set_status(f"Added from lucyna.dev: {title or url}")
+
+        # Auto-start when a deep link arrives. Two distinct cases:
+        #   1. No worker running → _on_start fires and kicks off the
+        #      batch (which now includes the new row + any other
+        #      pending rows e.g. failed retries the user hasn't cleared).
+        #   2. Worker already running (batch mid-flight) → no kickoff;
+        #      our new row sits with status=QUEUED and the existing
+        #      worker's pool finishes the current jobs without
+        #      autonomously picking up new appends. The existing
+        #      _on_all_done → _update_start_btn cycle re-enables the
+        #      Download button, and the user (or the NEXT incoming
+        #      deep link) re-triggers the worker for the leftover
+        #      pending rows. This matches the spec: no double-start,
+        #      no second worker spawned, no double-thread.
+        # Guard mirrors _update_start_btn: only fire if the start
+        # button would have been enabled (no worker running, has
+        # pending job, ffmpeg + ffprobe both present). start_btn was
+        # just refreshed by the _update_start_btn() call above, so its
+        # state is current and authoritative for our auto-trigger.
+        auto_started = (
+            self._worker_thread is None
+            and self.start_btn.isEnabled()
+        )
+        if auto_started:
+            self._on_start()
+            # _on_start sets its own "Downloading N item(s)…" status
+            # message — override with the title-aware variant so the
+            # user can see what specifically just kicked off, and so
+            # the "from lucyna.dev" provenance stays visible.
+            self._set_status(f"Downloading from lucyna.dev: {title or url}")
+        else:
+            self._set_status(f"Added from lucyna.dev: {title or url}")
 
     def _on_secondary_launch(self):
         """
