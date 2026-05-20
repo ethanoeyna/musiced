@@ -1,25 +1,21 @@
 """
 Musiced — local-library audio downloader. PyQt6 desktop app.
 
-Download backend: yt-dlp (YouTube, SoundCloud, Bandcamp, Archive, Vimeo, etc.).
+Download backends:
+  - yt-dlp for YouTube, SoundCloud, Bandcamp, Archive, Vimeo, etc.
+  - spotdl for Spotify URLs (open.spotify.com/... or spotify:...)
+    — invoked as `python -m spotdl` subprocess
+    — finds matching YouTube upload, downloads via spotdl's bundled yt-dlp,
+      tags the resulting file with Spotify's official metadata
 
-Stateless by design: no config files, no queue persistence, no JSON written
-anywhere. Each launch starts fresh.
-  - Output folder defaults to ~/Downloads/musiced (created lazily on the
-    first download, not on startup).
-  - Output format defaults to AAC 256 kbps (m4a_256).
-  - Format dropdown and "Change folder" remain functional for in-session
-    use; the choices simply don't survive a restart. This is intentional.
-
-This matters for the portable .exe distribution: nothing spawns next to the
-executable. Drop Musiced.exe anywhere — Desktop, USB stick, network share —
-and it leaves no footprint beyond the files it downloads into the chosen
-output folder.
+Job dispatch is by URL inspection in DownloadWorker._run_one:
+  - Spotify URLs → _run_one_spotdl
+  - Everything else → existing yt-dlp pipeline
 
 Deeplink protocol (lucyna://download?url=...&title=...):
   - Accepted from lucyna.dev/musiced search results' Download buttons
   - The `url` query param is the actual track URL to queue; it can be
-    any source yt-dlp supports
+    any source the above backends support
   - Optional `title` query param is used as the display name until the
     title prefetch / download resolves the canonical name
   - Single-instance enforcement via QLocalServer — secondary launches
@@ -27,6 +23,7 @@ Deeplink protocol (lucyna://download?url=...&title=...):
     raises its window
 """
 
+import json
 import os
 import re
 import shutil
@@ -53,6 +50,15 @@ from PyQt6.QtWidgets import (
 APP_NAME = "Musiced"
 APP_DIR = Path(__file__).resolve().parent
 
+# Writable state lives next to the exe when bundled (PyInstaller's _MEIPASS
+# is a temp dir that gets wiped on each launch), next to the script otherwise.
+if getattr(sys, "frozen", False):
+    DATA_DIR = Path(sys.executable).parent / "data"
+else:
+    DATA_DIR = APP_DIR / "data"
+CONFIG_PATH = DATA_DIR / "config.json"
+QUEUE_PATH = DATA_DIR / "queue.json"
+
 MAX_PARALLEL = 3
 MAX_RETRIES = 2
 
@@ -68,7 +74,7 @@ FORMATS = {
     "mp3_320":  {"codec": "mp3",  "ext": ".mp3",  "label": "MP3 320 kbps (compatible)", "kbps": "320"},
     "m4a_256":  {"codec": "m4a",  "ext": ".m4a",  "label": "AAC 256 kbps (compatible)", "kbps": "256"},
 }
-DEFAULT_FORMAT_KEY = "m4a_256"
+DEFAULT_FORMAT_KEY = "flac"
 # All audio extensions Musiced may have written — used by the orphan sweeper
 # so leftover thumbnails are cleaned up regardless of the current format.
 AUDIO_EXTS = tuple({fmt["ext"] for fmt in FORMATS.values()})
@@ -78,6 +84,24 @@ AUDIO_EXTS = tuple({fmt["ext"] for fmt in FORMATS.values()})
 # launches hand off their argv on this socket; the primary picks it up via
 # the `newConnection` signal and treats it as a fresh deep-link.
 SINGLE_INSTANCE_KEY = "lucyna.musiced.singleinstance"
+
+
+def _default_music_dir() -> Path:
+    return Path.home() / "Downloads" / "musiced"
+
+
+def _load_json(path: Path, default):
+    if not path.exists():
+        return default
+    try:
+        return json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError):
+        return default
+
+
+def _save_json(path: Path, value):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(value, indent=2))
 
 
 # ----------------------------------------------------------------------------
@@ -374,7 +398,7 @@ def _apply_style(app: QApplication):
 
 
 # ----------------------------------------------------------------------------
-# yt-dlp helpers
+# yt-dlp / spotdl helpers
 # ----------------------------------------------------------------------------
 
 INVALID_FNAME = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
@@ -393,6 +417,11 @@ def _is_youtube_playlist(url: str) -> bool:
     return ("youtube.com" in url or "youtu.be" in url) and (
         "list=" in url or "/playlist" in url
     )
+
+
+def _is_spotify_url(url: str) -> bool:
+    """Match Spotify track / album / playlist / artist URLs and native spotify: URIs."""
+    return "open.spotify.com" in url or url.startswith("spotify:")
 
 
 def _expand_youtube_playlist(url: str) -> list[dict]:
@@ -419,6 +448,15 @@ def _expand_youtube_playlist(url: str) -> list[dict]:
 
 
 def _fetch_title(url: str) -> str | None:
+    """
+    Pre-fetch a track's title. Spotify is short-circuited because the
+    pre-fetcher uses yt-dlp's extract_info, which doesn't understand
+    Spotify URLs. spotdl resolves the title at download time; the file
+    rename reveals the canonical name. Avoids pulling in spotipy as a
+    runtime dependency just for the title lookup.
+    """
+    if _is_spotify_url(url):
+        return None
     from yt_dlp import YoutubeDL
     opts = {
         "quiet": True,
@@ -577,6 +615,16 @@ class DownloadWorker(QObject):
         self.all_done.emit()
 
     def _run_one(self, job: DownloadJob, list_i: int):
+        # Dispatch by URL: Spotify URLs go to spotdl (it finds the YouTube
+        # match and applies Spotify's official metadata), everything else
+        # stays on yt-dlp. The skip-if-already-exists check is shared
+        # below so the user doesn't re-download tracks regardless of which
+        # backend would handle them.
+        if _is_spotify_url(job.url):
+            return self._run_one_spotdl(job, list_i)
+        return self._run_one_ytdlp(job, list_i)
+
+    def _run_one_ytdlp(self, job: DownloadJob, list_i: int):
         from yt_dlp import YoutubeDL
 
         # Skip if a file with this title already exists in ANY of our known
@@ -660,6 +708,82 @@ class DownloadWorker(QObject):
 
         self.job_finished.emit(list_i, DownloadJob.FAILED, _strip_ansi(last_err))
 
+    def _run_one_spotdl(self, job: DownloadJob, list_i: int):
+        """
+        Download a Spotify URL via spotdl. spotdl runs as a subprocess —
+        it's a heavy import (spotipy + yt-dlp + tagging libs) and we don't
+        want it eagerly loaded on every Musiced startup, only when a
+        Spotify URL actually lands in the queue.
+
+        spotdl finds the matching YouTube upload, downloads via its bundled
+        yt-dlp, and tags the result with Spotify's official metadata
+        (track name, artist, album, art, lyrics if available).
+
+        Progress is bookended (25 → 100) rather than parsed line-by-line:
+        spotdl's stdout isn't structured for per-percentage extraction, and
+        the user mostly cares that *something* is happening + the final
+        result lands.
+        """
+        import subprocess
+
+        self.job_started.emit(list_i)
+
+        # Map our codec key to spotdl's --format choices. spotdl supports
+        # the same lossy formats yt-dlp does (mp3/opus/m4a) plus FLAC; for
+        # anything we don't have a direct mapping for, fall back to mp3.
+        spotdl_format = {
+            "flac": "flac",
+            "opus": "opus",
+            "mp3":  "mp3",
+            "m4a":  "m4a",
+        }.get(self.format_spec["codec"], "mp3")
+
+        # spotdl uses its own templating syntax. {title} / {artist} / {album}
+        # are all supported; we keep the file name in line with yt-dlp's by
+        # using {title}.{output-ext} — spotdl emits the right extension
+        # based on --format.
+        output_template = str(job.out_dir / "{title}.{output-ext}")
+
+        cmd = [
+            sys.executable, "-m", "spotdl",
+            "download", job.url,
+            "--format", spotdl_format,
+            "--output", output_template,
+            "--print-errors",
+        ]
+        if self.ffmpeg_location:
+            cmd.extend(["--ffmpeg", self.ffmpeg_location])
+        if self.format_spec["kbps"]:
+            cmd.extend(["--bitrate", f"{self.format_spec['kbps']}k"])
+
+        last_err = ""
+        for attempt in range(MAX_RETRIES + 1):
+            try:
+                job.out_dir.mkdir(parents=True, exist_ok=True)
+                # Bookend progress only — see method docstring.
+                self.job_progress.emit(list_i, job.title, 25)
+                proc = subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=600,  # 10 min — Spotify albums can be long
+                )
+                self.job_progress.emit(list_i, job.title, 100)
+                if proc.returncode == 0:
+                    _cleanup_thumbnails(job.out_dir, job.title)
+                    self.job_finished.emit(list_i, DownloadJob.DONE, "")
+                    return
+                raw = (proc.stderr or proc.stdout or "spotdl failed").strip()
+                last_err = raw.splitlines()[0][:200] if raw else "spotdl failed"
+            except subprocess.TimeoutExpired:
+                last_err = "spotdl timed out after 10 minutes"
+            except Exception as e:
+                last_err = str(e)
+            if attempt < MAX_RETRIES:
+                time.sleep(1.5 * (attempt + 1))
+
+        self.job_finished.emit(list_i, DownloadJob.FAILED, _strip_ansi(last_err))
+
 
 # ----------------------------------------------------------------------------
 # Title pre-fetch worker
@@ -690,14 +814,15 @@ class Musiced(QMainWindow):
         self.resize(900, 600)
         self.setMinimumSize(640, 420)
 
-        # Stateless: output folder is hard-coded, no config load. The folder
-        # is NOT created here — the download path's mkdir handles that lazily
-        # when the first track actually downloads, so a Musiced launch leaves
-        # no footprint until you actually use it.
-        self._out_dir = Path.home() / "Downloads" / "musiced"
-        # Stateless: format is hard-coded to AAC 256 — same reasoning. The
-        # dropdown is still wired up for in-session changes.
-        self._format_key = "m4a_256"
+        self._config = _load_json(CONFIG_PATH, {})
+        self._out_dir = Path(
+            self._config.get("out_dir") or _default_music_dir()
+        )
+        self._out_dir.mkdir(parents=True, exist_ok=True)
+        # Output format. Stored in config so the choice survives restarts.
+        # Validate against the catalog — unknown values fall back to default.
+        saved_fmt = self._config.get("format")
+        self._format_key = saved_fmt if saved_fmt in FORMATS else DEFAULT_FORMAT_KEY
         self._jobs: list[DownloadJob] = []
         self._worker_thread: QThread | None = None
         self._worker: DownloadWorker | None = None
@@ -718,6 +843,7 @@ class Musiced(QMainWindow):
 
         self.setFont(_make_font(10))
         self._build_ui()
+        self._restore_queue()
         self._refresh_out_label()
         self._refresh_ffmpeg_status()
         self._update_start_btn()
@@ -779,7 +905,7 @@ class Musiced(QMainWindow):
         url_row.setSpacing(8)
         self.url_input = QLineEdit()
         self.url_input.setPlaceholderText(
-            "Paste a URL — YouTube, SoundCloud, Bandcamp, etc."
+            "Paste a URL — YouTube, SoundCloud, Spotify, Bandcamp, etc."
         )
         self.url_input.returnPressed.connect(self._on_add_url)
         url_row.addWidget(self.url_input, stretch=1)
@@ -829,6 +955,21 @@ class Musiced(QMainWindow):
                 COLOR_STATUS_ERR,
             )
 
+    def _restore_queue(self):
+        data = _load_json(QUEUE_PATH, [])
+        for d in data:
+            try:
+                job = DownloadJob.from_dict(d)
+                if job.status in (DownloadJob.DONE, DownloadJob.SKIPPED):
+                    continue
+                self._jobs.append(job)
+                self._render_job_row(job, len(self._jobs) - 1)
+            except Exception:
+                continue
+
+    def _save_queue(self):
+        _save_json(QUEUE_PATH, [j.to_dict() for j in self._jobs])
+
     def _render_job_row(self, job: DownloadJob, list_i: int):
         if job.status == DownloadJob.QUEUED:
             text = f"[queued]  {job.title}"
@@ -877,14 +1018,16 @@ class Musiced(QMainWindow):
         self.start_btn.setEnabled(ready)
 
     def _on_format_changed(self, index: int):
-        # In-session only — no persistence. Any *in-flight* worker keeps its
-        # captured format_spec; only the next batch picks up the new value.
-        # This keeps a running job's output extension consistent with what
-        # was selected when the user hit Download.
+        # Persist the new format choice immediately. Any *in-flight* worker
+        # keeps its captured format_spec — only the next batch picks up the
+        # new value. This keeps a running job's output extension consistent
+        # with what was selected when the user hit Download.
         key = self.format_combo.itemData(index)
         if key not in FORMATS:
             return
         self._format_key = key
+        self._config["format"] = key
+        _save_json(CONFIG_PATH, self._config)
 
     def _on_change_dir(self):
         path = QFileDialog.getExistingDirectory(
@@ -892,6 +1035,9 @@ class Musiced(QMainWindow):
         )
         if path:
             self._out_dir = Path(path)
+            self._out_dir.mkdir(parents=True, exist_ok=True)
+            self._config["out_dir"] = str(self._out_dir)
+            _save_json(CONFIG_PATH, self._config)
             self._refresh_out_label()
 
     def _on_open_dir(self):
@@ -916,6 +1062,7 @@ class Musiced(QMainWindow):
         except Exception as e:
             self._set_status(f"Add failed: {e}", COLOR_STATUS_ERR)
             return
+        self._save_queue()
         self._update_start_btn()
 
     def _add_single(self, url: str):
@@ -957,6 +1104,7 @@ class Musiced(QMainWindow):
             return
         job.title = title
         self._render_job_row(job, list_i)
+        self._save_queue()
 
     # ----- Deep link plumbing -----
 
@@ -967,8 +1115,34 @@ class Musiced(QMainWindow):
         list_i = len(self._jobs) - 1
         self._render_job_row(job, list_i)
         self._prefetch_title(list_i, url)
+        self._save_queue()
         self._update_start_btn()
-        self._set_status(f"Added from lucyna.dev: {title or url}")
+
+        # Auto-start downloading when a deep link arrives. User already
+        # expressed intent by clicking Download on lucyna.dev — no need
+        # for them to click again in the Musiced window. If a worker is
+        # already running (batch in progress), the new row is picked up
+        # by the existing batch's queue scan; no kickoff needed.
+        # Manual paste (_add_single + start button) intentionally stays
+        # a two-step flow — users often queue several URLs before
+        # hitting Download.
+        # Guard mirrors _update_start_btn: only fire if the start
+        # button would have been enabled (no worker running, has
+        # pending job, ffmpeg + ffprobe both present). start_btn was
+        # just refreshed by the _update_start_btn() call above, so its
+        # enabled state is current and authoritative.
+        auto_started = (
+            self._worker_thread is None
+            and self.start_btn.isEnabled()
+        )
+        if auto_started:
+            self._on_start()
+            # _on_start sets its own "Downloading N item(s)…" status
+            # message — override with the title-aware variant so the
+            # user can see what specifically just kicked off.
+            self._set_status(f"Downloading from lucyna.dev: {title or url}")
+        else:
+            self._set_status(f"Added from lucyna.dev: {title or url}")
 
     def _on_secondary_launch(self):
         """
@@ -1018,6 +1192,7 @@ class Musiced(QMainWindow):
             return
         del self._jobs[list_i]
         self.queue_list.takeItem(list_i)
+        self._save_queue()
         self._update_start_btn()
 
     def _retry_one(self, list_i: int):
@@ -1028,6 +1203,7 @@ class Musiced(QMainWindow):
         job.progress = 0
         job.error = ""
         self._render_job_row(job, list_i)
+        self._save_queue()
         self._update_start_btn()
 
     def _on_clear(self):
@@ -1035,6 +1211,7 @@ class Musiced(QMainWindow):
             return
         self._jobs.clear()
         self.queue_list.clear()
+        self._save_queue()
         self._update_start_btn()
         self._set_status("Ready.")
 
@@ -1103,6 +1280,7 @@ class Musiced(QMainWindow):
             job.status = DownloadJob.FAILED
             job.error = msg
         self._render_job_row(job, list_i)
+        self._save_queue()
 
     def _on_all_done(self):
         if self._worker_thread is not None:
@@ -1132,6 +1310,7 @@ class Musiced(QMainWindow):
             COLOR_STATUS_INFO
         )
         self._set_status("Done. " + ", ".join(parts) + ".", color)
+        self._save_queue()
 
 
 def main():
