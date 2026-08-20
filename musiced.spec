@@ -69,8 +69,8 @@ if _is_mac:
                 'CFBundleURLName': 'dev.lucyna.musiced',
                 'CFBundleURLSchemes': ['lucyna'],
             }],
-            'CFBundleShortVersionString': '0.3.3',
-            'CFBundleVersion': '0.3.3',
+            'CFBundleShortVersionString': '0.3.4',
+            'CFBundleVersion': '0.3.4',
             'LSMinimumSystemVersion': '11.0',
             'NSHighResolutionCapable': True,
             # No need for microphone / files-and-folders entitlements — we

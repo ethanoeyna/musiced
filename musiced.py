@@ -66,14 +66,23 @@ THUMBNAIL_EXTS = (".jpg", ".jpeg", ".png", ".webp")
 # shown in the UI, and the optional kbps the FFmpegExtractAudio postprocessor
 # should pass when encoding a lossy codec. FLAC is lossless so kbps is unused.
 # The optional "video" flag switches the download to keep the source video
-# (bestvideo+bestaudio merged) instead of extracting audio-only.
+# (bestvideo+bestaudio merged) instead of extracting audio-only; the paired
+# "format_selector" is passed to yt-dlp verbatim as its `format` option to
+# cap the resolution (source rarely exceeds it, so `<=` degrades gracefully
+# to whatever the site actually offers).
 FORMATS = {
-    "flac":      {"codec": "flac", "ext": ".flac", "label": "FLAC (lossless)",             "kbps": None},
-    "opus_192":  {"codec": "opus", "ext": ".opus", "label": "Opus 192 kbps (small)",       "kbps": "192"},
-    "opus_256":  {"codec": "opus", "ext": ".opus", "label": "Opus 256 kbps (transparent)", "kbps": "256"},
-    "mp3_320":   {"codec": "mp3",  "ext": ".mp3",  "label": "MP3 320 kbps (compatible)",   "kbps": "320"},
-    "m4a_256":   {"codec": "m4a",  "ext": ".m4a",  "label": "AAC 256 kbps (compatible)",   "kbps": "256"},
-    "video_mp4": {"codec": None,   "ext": ".mp4",  "label": "MP4 video (keep video)",      "kbps": None, "video": True},
+    "flac":       {"codec": "flac", "ext": ".flac", "label": "FLAC (lossless)",             "kbps": None},
+    "opus_192":   {"codec": "opus", "ext": ".opus", "label": "Opus 192 kbps (small)",       "kbps": "192"},
+    "opus_256":   {"codec": "opus", "ext": ".opus", "label": "Opus 256 kbps (transparent)", "kbps": "256"},
+    "mp3_320":    {"codec": "mp3",  "ext": ".mp3",  "label": "MP3 320 kbps (compatible)",   "kbps": "320"},
+    "m4a_256":    {"codec": "m4a",  "ext": ".m4a",  "label": "AAC 256 kbps (compatible)",   "kbps": "256"},
+    "video_best": {"codec": None,   "ext": ".mp4",  "label": "MP4 video — best available",  "kbps": None, "video": True, "format_selector": "bestvideo+bestaudio/best"},
+    "video_2160": {"codec": None,   "ext": ".mp4",  "label": "MP4 video — 4K (2160p max)",  "kbps": None, "video": True, "format_selector": "bestvideo[height<=2160]+bestaudio/best[height<=2160]"},
+    "video_1440": {"codec": None,   "ext": ".mp4",  "label": "MP4 video — 1440p max",       "kbps": None, "video": True, "format_selector": "bestvideo[height<=1440]+bestaudio/best[height<=1440]"},
+    "video_1080": {"codec": None,   "ext": ".mp4",  "label": "MP4 video — 1080p max",       "kbps": None, "video": True, "format_selector": "bestvideo[height<=1080]+bestaudio/best[height<=1080]"},
+    "video_720":  {"codec": None,   "ext": ".mp4",  "label": "MP4 video — 720p max",        "kbps": None, "video": True, "format_selector": "bestvideo[height<=720]+bestaudio/best[height<=720]"},
+    "video_480":  {"codec": None,   "ext": ".mp4",  "label": "MP4 video — 480p max",        "kbps": None, "video": True, "format_selector": "bestvideo[height<=480]+bestaudio/best[height<=480]"},
+    "video_360":  {"codec": None,   "ext": ".mp4",  "label": "MP4 video — 360p max",        "kbps": None, "video": True, "format_selector": "bestvideo[height<=360]+bestaudio/best[height<=360]"},
 }
 DEFAULT_FORMAT_KEY = "m4a_256"
 # All media extensions Musiced may have written — used by the "already exists"
@@ -323,6 +332,11 @@ def _apply_style(app: QApplication):
     p.setColor(QPalette.ColorRole.HighlightedText, COLOR_TEXT_ON_ACCENT)
     p.setColor(QPalette.ColorRole.ToolTipBase, COLOR_BG_RAISED)
     p.setColor(QPalette.ColorRole.ToolTipText, COLOR_TEXT_PRIMARY)
+    # PlaceholderText defaults to a semi-transparent WindowText, which on
+    # macOS renders as near-invisible dark-grey on our dark input bg. Pin
+    # it to our secondary-text grey so the URL input hint is readable on
+    # both platforms.
+    p.setColor(QPalette.ColorRole.PlaceholderText, COLOR_TEXT_SECONDARY)
     app.setPalette(p)
     app.setFont(_make_font(10))
 
@@ -622,7 +636,10 @@ class DownloadWorker(QObject):
         # so a video-format download of an audio track still lands something.
         if self.format_spec.get("video"):
             opts = {
-                "format": "bestvideo+bestaudio/best",
+                # Prefer the format_selector on the entry; older entries
+                # without one fall back to plain best-available so the
+                # branch stays safe if a new video entry forgets it.
+                "format": self.format_spec.get("format_selector") or "bestvideo+bestaudio/best",
                 "merge_output_format": "mp4",
                 "outtmpl": str(job.out_dir / "%(title)s.%(ext)s"),
                 "postprocessors": [
