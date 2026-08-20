@@ -65,16 +65,21 @@ THUMBNAIL_EXTS = (".jpg", ".jpeg", ".png", ".webp")
 # Output format catalog. Each entry: yt-dlp codec key, target extension, label
 # shown in the UI, and the optional kbps the FFmpegExtractAudio postprocessor
 # should pass when encoding a lossy codec. FLAC is lossless so kbps is unused.
+# The optional "video" flag switches the download to keep the source video
+# (bestvideo+bestaudio merged) instead of extracting audio-only.
 FORMATS = {
-    "flac":     {"codec": "flac", "ext": ".flac", "label": "FLAC (lossless)",          "kbps": None},
-    "opus_192": {"codec": "opus", "ext": ".opus", "label": "Opus 192 kbps (small)",    "kbps": "192"},
-    "opus_256": {"codec": "opus", "ext": ".opus", "label": "Opus 256 kbps (transparent)", "kbps": "256"},
-    "mp3_320":  {"codec": "mp3",  "ext": ".mp3",  "label": "MP3 320 kbps (compatible)", "kbps": "320"},
-    "m4a_256":  {"codec": "m4a",  "ext": ".m4a",  "label": "AAC 256 kbps (compatible)", "kbps": "256"},
+    "flac":      {"codec": "flac", "ext": ".flac", "label": "FLAC (lossless)",             "kbps": None},
+    "opus_192":  {"codec": "opus", "ext": ".opus", "label": "Opus 192 kbps (small)",       "kbps": "192"},
+    "opus_256":  {"codec": "opus", "ext": ".opus", "label": "Opus 256 kbps (transparent)", "kbps": "256"},
+    "mp3_320":   {"codec": "mp3",  "ext": ".mp3",  "label": "MP3 320 kbps (compatible)",   "kbps": "320"},
+    "m4a_256":   {"codec": "m4a",  "ext": ".m4a",  "label": "AAC 256 kbps (compatible)",   "kbps": "256"},
+    "video_mp4": {"codec": None,   "ext": ".mp4",  "label": "MP4 video (keep video)",      "kbps": None, "video": True},
 }
 DEFAULT_FORMAT_KEY = "m4a_256"
-# All audio extensions Musiced may have written — used by the orphan sweeper
-# so leftover thumbnails are cleaned up regardless of the current format.
+# All media extensions Musiced may have written — used by the "already exists"
+# skip check and the orphan sweeper so leftover thumbnails are cleaned up
+# regardless of the current format. Includes both audio codecs and .mp4 for
+# the video format, so switching between them still de-dups the same title.
 AUDIO_EXTS = tuple({fmt["ext"] for fmt in FORMATS.values()})
 
 # Single-instance socket key. QLocalServer/QLocalSocket use a named socket
@@ -611,37 +616,59 @@ class DownloadWorker(QObject):
                 title = d.get("info_dict", {}).get("title") or job.title
                 self.job_progress.emit(idx, title, 100)
 
-        # Build the FFmpegExtractAudio postprocessor block. FLAC is lossless,
-        # so we omit the quality field; for lossy codecs we pass preferredquality
-        # which yt-dlp surfaces to ffmpeg as the target bitrate.
-        extract_pp: dict = {
-            "key": "FFmpegExtractAudio",
-            "preferredcodec": self.format_spec["codec"],
-        }
-        if self.format_spec["kbps"]:
-            extract_pp["preferredquality"] = self.format_spec["kbps"]
+        # Video branch: keep the source video merged to mp4. No audio
+        # extraction, no thumbnail embedding (the video already has a poster
+        # frame). Falls back to `best` for audio-only sources like SoundCloud
+        # so a video-format download of an audio track still lands something.
+        if self.format_spec.get("video"):
+            opts = {
+                "format": "bestvideo+bestaudio/best",
+                "merge_output_format": "mp4",
+                "outtmpl": str(job.out_dir / "%(title)s.%(ext)s"),
+                "postprocessors": [
+                    {"key": "FFmpegMetadata", "add_metadata": True},
+                ],
+                "quiet": True,
+                "no_warnings": True,
+                "progress_hooks": [hook],
+                "noprogress": True,
+                "noplaylist": True,
+                "retries": 3,
+                "fragment_retries": 3,
+                "keepvideo": False,
+            }
+        else:
+            # Build the FFmpegExtractAudio postprocessor block. FLAC is lossless,
+            # so we omit the quality field; for lossy codecs we pass preferredquality
+            # which yt-dlp surfaces to ffmpeg as the target bitrate.
+            extract_pp: dict = {
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": self.format_spec["codec"],
+            }
+            if self.format_spec["kbps"]:
+                extract_pp["preferredquality"] = self.format_spec["kbps"]
 
-        opts = {
-            "format": (
-                "bestaudio[ext=m4a]/bestaudio[ext=webm]/"
-                "bestaudio[ext=opus]/bestaudio/best"
-            ),
-            "outtmpl": str(job.out_dir / "%(title)s.%(ext)s"),
-            "postprocessors": [
-                extract_pp,
-                {"key": "FFmpegMetadata", "add_metadata": True},
-                {"key": "EmbedThumbnail", "already_have_thumbnail": False},
-            ],
-            "writethumbnail": True,
-            "quiet": True,
-            "no_warnings": True,
-            "progress_hooks": [hook],
-            "noprogress": True,
-            "noplaylist": True,
-            "retries": 3,
-            "fragment_retries": 3,
-            "keepvideo": False,
-        }
+            opts = {
+                "format": (
+                    "bestaudio[ext=m4a]/bestaudio[ext=webm]/"
+                    "bestaudio[ext=opus]/bestaudio/best"
+                ),
+                "outtmpl": str(job.out_dir / "%(title)s.%(ext)s"),
+                "postprocessors": [
+                    extract_pp,
+                    {"key": "FFmpegMetadata", "add_metadata": True},
+                    {"key": "EmbedThumbnail", "already_have_thumbnail": False},
+                ],
+                "writethumbnail": True,
+                "quiet": True,
+                "no_warnings": True,
+                "progress_hooks": [hook],
+                "noprogress": True,
+                "noplaylist": True,
+                "retries": 3,
+                "fragment_retries": 3,
+                "keepvideo": False,
+            }
 
         # Point yt-dlp at our bundled ffmpeg/ffprobe (covers both binaries)
         if self.ffmpeg_location:
